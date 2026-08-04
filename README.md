@@ -41,3 +41,6 @@ Uyarılar
 - Playwright destekli scraper (Amazon için)
 - Dockerfile veya Railway/Heroku deployment örneği
 - GitHub Actions ile otomatik deploy
+
+
+Trigger: workflow dispatch test — update by Copilot on 2026-08-04
