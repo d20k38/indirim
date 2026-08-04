@@ -11,6 +11,8 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask, g, jsonify, redirect, render_template, request, url_for
 
+from rapidfuzz import fuzz
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # Telegram bot token
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # chat id to send messages
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", 3600))  # default 3600 = 1 saat
@@ -45,6 +47,31 @@ def init_db():
            last_price REAL,
            desired_price REAL,
            last_checked TEXT
+        )"""
+    )
+    # Optional tables for listings/deals (future features)
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS listings (
+           id INTEGER PRIMARY KEY,
+           url TEXT NOT NULL UNIQUE,
+           site TEXT,
+           name TEXT,
+           last_scanned TEXT
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS deals (
+           id INTEGER PRIMARY KEY,
+           listing_id INTEGER,
+           product_url TEXT,
+           title TEXT,
+           old_price REAL,
+           new_price REAL,
+           discount_pct REAL,
+           first_seen TEXT,
+           last_seen TEXT,
+           UNIQUE(listing_id, product_url),
+           FOREIGN KEY(listing_id) REFERENCES listings(id)
         )"""
     )
     db.commit()
@@ -89,7 +116,9 @@ def price_trendyol(html):
     selectors = [
         ".prc-slg .prc-slg-w",  # önceki / yeni sınıflar
         ".prc-dsc",  # fallback
-        ".price"
+        ".price",
+        "span[data-test=price]",
+        ".prc-slg"
     ]
     for sel in selectors:
         el = soup.select_one(sel)
@@ -247,7 +276,71 @@ def scheduler_thread():
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
+# --- Price discrepancy detection (cross-site) ---
+def normalize_title(t):
+    if not t:
+        return ""
+    s = t.lower()
+    s = re.sub(r"[^0-9a-zığüşöçİĞÜŞÖÇ\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def load_products_with_prices():
+    db = sqlite3.connect(DB_PATH)
+    c = db.cursor()
+    c.execute("SELECT id, url, site, title, last_price FROM products WHERE last_price IS NOT NULL AND title IS NOT NULL")
+    rows = [dict(zip([d[0] for d in c.description], r)) for r in c.fetchall()]
+    db.close()
+    for r in rows:
+        r["norm_title"] = normalize_title(r.get("title") or "")
+    return rows
+
+
+def find_discrepancies(pct_threshold=100.0, sim_threshold=80):
+    prods = load_products_with_prices()
+    n = len(prods)
+    results = []
+    for i in range(n):
+        a = prods[i]
+        for j in range(i + 1, n):
+            b = prods[j]
+            if a["site"] == b["site"]:
+                continue
+            sim = fuzz.token_sort_ratio(a["norm_title"], b["norm_title"]) if a["norm_title"] and b["norm_title"] else 0
+            if sim < sim_threshold:
+                continue
+            pa = a["last_price"]
+            pb = b["last_price"]
+            if pa is None or pb is None or pa <= 0 or pb <= 0:
+                continue
+            bigger = max(pa, pb)
+            smaller = min(pa, pb)
+            pct_diff = (bigger - smaller) / smaller * 100.0
+            if pct_diff >= pct_threshold:
+                cheaper = a if a["last_price"] < b["last_price"] else b
+                expensive = b if cheaper is a else a
+                results.append({
+                    "a_id": a["id"], "a_url": a["url"], "a_site": a["site"], "a_title": a["title"], "a_price": pa,
+                    "b_id": b["id"], "b_url": b["url"], "b_site": b["site"], "b_title": b["title"], "b_price": pb,
+                    "similarity": sim,
+                    "pct_diff": round(pct_diff, 2),
+                    "cheaper_site": cheaper["site"],
+                    "cheaper_price": cheaper["last_price"],
+                })
+    results.sort(key=lambda x: x["pct_diff"], reverse=True)
+    return results
+
+
 # --- Routes ---
+@app.route("/admin/discrepancies", methods=["GET"])
+def admin_discrepancies():
+    pct = float(request.args.get("pct", 100.0))
+    sim = int(request.args.get("sim", 80))
+    res = find_discrepancies(pct_threshold=pct, sim_threshold=sim)
+    return jsonify({"count": len(res), "results": res})
+
+
 @app.route("/", methods=["GET"])
 def index():
     db = get_db()
