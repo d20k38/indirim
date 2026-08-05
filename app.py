@@ -100,24 +100,7 @@ def close_connection(exception):
 
 
 # --- Fetching (ScrapingBee optional) ---
-def get_page(url):
-    # If SCRAPINGBEE_KEY present, use it to render JS and avoid blocks
-    if SCRAPINGBEE_KEY:
-        api_url = f"https://app.scrapingbee.com/api/v1?api_key={SCRAPINGBEE_KEY}&url={quote_plus(url)}&render_js=true&premium_proxy=true"
-        try:
-            r = requests.get(api_url, headers={"Accept": "text/html"}, timeout=30)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            print("ScrapingBee fetch failed:", e)
-            # fallthrough to direct
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        print("Direct fetch failed:", e)
-        return None
+def get_page(url): # If SCRAPINGBEE_KEY present, use it to render JS and avoid blocks key = os.getenv("SCRAPINGBEE_KEY") if key: api_url = f"https://app.scrapingbee.com/api/v1?api_key={key}&url={quote_plus(url)}&render_js=true&premium_proxy=true" try: r = requests.get(api_url, headers={"Accept": "text/html"}, timeout=30) print("ScrapingBee status:", r.status_code) if r.status_code == 200 and r.text: return r.text else: print("ScrapingBee returned non-200 or empty body; falling back to direct fetch") except Exception as e: print("ScrapingBee fetch failed:", e) # fallthrough to direct # Direct fetch fallback try: r = requests.get(url, headers=HEADERS, timeout=15) print("Direct fetch status:", r.status_code) r.raise_for_status() return r.text except Exception as e: print("Direct fetch failed:", e) return None
 
 
 # --- Generic price parsing helpers ---
