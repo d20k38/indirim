@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,6 +16,7 @@ from rapidfuzz import fuzz
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # Telegram bot token
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # chat id to send messages
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", 3600))  # default 3600 = 1 saat
+SCRAPINGBEE_KEY = os.environ.get("SCRAPINGBEE_KEY")  # optional scraping API key
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -49,7 +50,6 @@ def init_db():
            last_checked TEXT
         )"""
     )
-    # Optional tables for listings/deals (future features)
     c.execute(
         """CREATE TABLE IF NOT EXISTS listings (
            id INTEGER PRIMARY KEY,
@@ -74,6 +74,20 @@ def init_db():
            FOREIGN KEY(listing_id) REFERENCES listings(id)
         )"""
     )
+    # table for scraped offers from aggregator sites / telegram
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS scraped_offers (
+           id INTEGER PRIMARY KEY,
+           site TEXT,
+           url TEXT,
+           title TEXT,
+           price REAL,
+           first_seen TEXT,
+           last_seen TEXT,
+           notified INTEGER DEFAULT 0,
+           UNIQUE(site, url)
+        )"""
+    )
     db.commit()
     db.close()
 
@@ -85,7 +99,28 @@ def close_connection(exception):
         db.close()
 
 
-# --- Site parsers (simple, may need tweaks over time) ---
+# --- Fetching (ScrapingBee optional) ---
+def get_page(url):
+    # If SCRAPINGBEE_KEY present, use it to render JS and avoid blocks
+    if SCRAPINGBEE_KEY:
+        api_url = f"https://app.scrapingbee.com/api/v1?api_key={SCRAPINGBEE_KEY}&url={quote_plus(url)}&render_js=true&premium_proxy=true"
+        try:
+            r = requests.get(api_url, headers={"Accept": "text/html"}, timeout=30)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            print("ScrapingBee fetch failed:", e)
+            # fallthrough to direct
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        print("Direct fetch failed:", e)
+        return None
+
+
+# --- Generic price parsing helpers ---
 def parse_price_from_text(text):
     if not text:
         return None
@@ -101,57 +136,15 @@ def parse_price_from_text(text):
         return None
 
 
-def get_page(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        return r.text
-    except Exception:
-        return None
-
-
+# --- Site parsers (examples) ---
 def price_trendyol(html):
     soup = BeautifulSoup(html, "html.parser")
-    # Trendyol değişken ama bu denemeler iş görürse...
     selectors = [
-        ".prc-slg .prc-slg-w",  # önceki / yeni sınıflar
-        ".prc-dsc",  # fallback
+        ".prc-slg .prc-slg-w",
+        ".prc-dsc",
         ".price",
         "span[data-test=price]",
         ".prc-slg"
-    ]
-    for sel in selectors:
-        el = soup.select_one(sel)
-        if el:
-            p = parse_price_from_text(el.get_text())
-            if p:
-                return p
-    # fallback: search whole page
-    return parse_price_from_text(soup.get_text())
-
-
-def price_hepsiburada(html):
-    soup = BeautifulSoup(html, "html.parser")
-    selectors = [
-        ".price-container .current-price",
-        ".product-price",
-        "#offering-price"
-    ]
-    for sel in selectors:
-        el = soup.select_one(sel)
-        if el:
-            p = parse_price_from_text(el.get_text())
-            if p:
-                return p
-    return parse_price_from_text(soup.get_text())
-
-
-def price_n11(html):
-    soup = BeautifulSoup(html, "html.parser")
-    selectors = [
-        ".proDetail .newPrice",
-        ".newPrice",
-        ".price"
     ]
     for sel in selectors:
         el = soup.select_one(sel)
@@ -167,7 +160,8 @@ def price_amazon(html):
     selectors = [
         "#priceblock_ourprice",
         "#priceblock_dealprice",
-        ".a-price .a-offscreen"
+        ".a-price .a-offscreen",
+        "span[data-a-color='price'] .a-offscreen",
     ]
     for sel in selectors:
         el = soup.select_one(sel)
@@ -175,13 +169,22 @@ def price_amazon(html):
             p = parse_price_from_text(el.get_text())
             if p:
                 return p
-    return parse_price_from_text(soup.get_text())
+    # fallback: look for TL symbol near numbers
+    txt = soup.get_text()
+    m = re.search(r"([0-9\.,]+)\s*(?:₺|TL|tl)", txt)
+    if m:
+        s = m.group(1).replace('.', '').replace(',', '.')
+        try:
+            return float(s)
+        except:
+            pass
+    return parse_price_from_text(txt)
 
 
 SITE_PARSERS = {
     "trendyol": price_trendyol,
-    "hepsiburada": price_hepsiburada,
-    "n11": price_n11,
+    "hepsiburada": price_trendyol,  # reuse generic for now
+    "n11": price_trendyol,
     "amazon": price_amazon
 }
 
@@ -196,6 +199,10 @@ def detect_site(url):
         return "n11"
     if "amazon" in host:
         return "amazon"
+    if "akakce" in host:
+        return "akakce"
+    if "cimri" in host:
+        return "cimri"
     return None
 
 
@@ -213,7 +220,7 @@ def send_telegram(text):
         print("Telegram send failed:", e)
 
 
-# --- Check logic ---
+# --- Check logic (products) ---
 def check_product(row):
     url = row["url"]
     site = row["site"] or detect_site(url)
@@ -222,7 +229,6 @@ def check_product(row):
         return None, "404"
     parser = SITE_PARSERS.get(site)
     if not parser:
-        # fallback generic parse
         price = parse_price_from_text(BeautifulSoup(html, "html.parser").get_text())
     else:
         price = parser(html)
@@ -242,12 +248,12 @@ def check_all():
     c = db.cursor()
     c.execute("SELECT * FROM products")
     rows = c.fetchall()
+    col_names = [d[0] for d in c.description] if c.description else []
     for r in rows:
-        prod = dict(zip([d[0] for d in c.description], r))
+        prod = dict(zip(col_names, r))
         price, title = check_product(prod)
         now = datetime.utcnow().isoformat()
         if price is not None:
-            # compare and update
             prev = prod.get("last_price")
             desired = prod.get("desired_price")
             c.execute(
@@ -274,6 +280,179 @@ def scheduler_thread():
         except Exception as e:
             print("Hata during check_all:", e)
         time.sleep(CHECK_INTERVAL_SECONDS)
+
+
+# --- Aggregator scrapers: akakce & cimri (basic implementations) ---
+
+def extract_price_from_element(el):
+    try:
+        return parse_price_from_text(el.get_text())
+    except:
+        return None
+
+
+def get_akakce_deals(listing_url="https://www.akakce.com/indirim/"):
+    html = get_page(listing_url)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    offers = []
+    # Generic approach: find links that contain product keywords and nearby price-like text
+    for a in soup.select("a[href]"):
+        href = a.get("href")
+        text = a.get_text(" ", strip=True)
+        if not text or len(text) < 5:
+            continue
+        # try to find price in parent or sibling
+        parent = a.parent
+        price = None
+        for candidate in [a, parent] + parent.find_all(recursive=False):
+            if candidate and candidate.get_text():
+                p = parse_price_from_text(candidate.get_text())
+                if p:
+                    price = p
+                    break
+        url = href
+        if url and url.startswith("/"):
+            url = "https://www.akakce.com" + url
+        if price and url:
+            offers.append({"site": "akakce", "url": url, "title": text[:180], "price": price})
+    # dedupe by url
+    seen = set()
+    dedup = []
+    for o in offers:
+        if o["url"] in seen:
+            continue
+        seen.add(o["url"])
+        dedup.append(o)
+    return dedup
+
+
+def get_cimri_deals(listing_url="https://www.cimri.com/indirimler/"):
+    html = get_page(listing_url)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    offers = []
+    for a in soup.select("a[href]"):
+        href = a.get("href")
+        text = a.get_text(" ", strip=True)
+        if not text or len(text) < 5:
+            continue
+        parent = a.parent
+        price = None
+        for candidate in [a, parent] + parent.find_all(recursive=False):
+            if candidate and candidate.get_text():
+                p = parse_price_from_text(candidate.get_text())
+                if p:
+                    price = p
+                    break
+        url = href
+        if url and url.startswith("/"):
+            url = "https://www.cimri.com" + url
+        if price and url:
+            offers.append({"site": "cimri", "url": url, "title": text[:180], "price": price})
+    seen = set()
+    dedup = []
+    for o in offers:
+        if o["url"] in seen:
+            continue
+        seen.add(o["url"])
+        dedup.append(o)
+    return dedup
+
+
+# --- Process scraped offers: store and notify if new/cheap ---
+
+def store_or_update_offer(o):
+    db = sqlite3.connect(DB_PATH)
+    c = db.cursor()
+    now = datetime.utcnow().isoformat()
+    try:
+        c.execute("INSERT INTO scraped_offers (site, url, title, price, first_seen, last_seen, notified) VALUES (?, ?, ?, ?, ?, ?, 0)",
+                  (o["site"], o["url"], o.get("title"), o["price"], now, now))
+        db.commit()
+        inserted = True
+    except sqlite3.IntegrityError:
+        # update last_seen and price if changed
+        c.execute("SELECT price, notified FROM scraped_offers WHERE site = ? AND url = ?", (o["site"], o["url"]))
+        row = c.fetchone()
+        prev_price = row[0] if row else None
+        notified = row[1] if row else 0
+        if prev_price != o["price"]:
+            c.execute("UPDATE scraped_offers SET price = ?, last_seen = ?, notified = 0 WHERE site = ? AND url = ?",
+                      (o["price"], now, o["site"], o["url"]))
+            db.commit()
+        inserted = False
+    db.close()
+    return inserted
+
+
+def find_similar_product_prices(title):
+    # simple title normalization + fuzzy matching against products table
+    db = sqlite3.connect(DB_PATH)
+    c = db.cursor()
+    c.execute("SELECT id, title, last_price, url, site FROM products WHERE last_price IS NOT NULL AND title IS NOT NULL")
+    rows = c.fetchall()
+    db.close()
+    norm = normalize_title(title)
+    matches = []
+    for r in rows:
+        pid, ptitle, pprice, purl, psite = r
+        score = fuzz.token_sort_ratio(norm, normalize_title(ptitle)) if ptitle else 0
+        if score >= 75:
+            matches.append({"id": pid, "title": ptitle, "price": pprice, "url": purl, "site": psite, "score": score})
+    return matches
+
+
+def process_scraped_offers(offers, pct_threshold=100.0, absolute_threshold=50.0):
+    # Store offers and notify if they seem like big bargains compared to known product prices
+    notified = []
+    for o in offers:
+        inserted = store_or_update_offer(o)
+        # check against known products
+        sims = find_similar_product_prices(o.get("title") or "")
+        other_prices = [s["price"] for s in sims if s.get("price")]
+        is_bargain = False
+        reason = None
+        if other_prices:
+            min_other = min(other_prices)
+            if min_other and min_other > 0:
+                pct = (min_other - o["price"]) / min_other * 100.0
+                if pct >= pct_threshold:
+                    is_bargain = True
+                    reason = f"%{round(pct,1)} daha ucuz (ortalama benzeri: {min_other} TL)"
+        else:
+            # if no comparable product known, consider absolute price threshold
+            if o["price"] <= absolute_threshold:
+                is_bargain = True
+                reason = f"Fiyat ≤ {absolute_threshold} TL"
+        if is_bargain:
+            msg = f"Fırsat: {o.get('title')}\n{o.get('url')}\nFiyat: {o.get('price')} TL\n{reason}"
+            send_telegram(msg)
+            notified.append(o)
+            # mark notified
+            db = sqlite3.connect(DB_PATH)
+            c = db.cursor()
+            c.execute("UPDATE scraped_offers SET notified = 1 WHERE site = ? AND url = ?", (o["site"], o["url"]))
+            db.commit()
+            db.close()
+    return notified
+
+
+# --- Combined scan function ---
+def scan_aggregators_and_process():
+    offers = []
+    try:
+        offers.extend(get_akakce_deals())
+    except Exception as e:
+        print("akakce scan error:", e)
+    try:
+        offers.extend(get_cimri_deals())
+    except Exception as e:
+        print("cimri scan error:", e)
+    print(f"Found {len(offers)} offers from aggregators")
+    return process_scraped_offers(offers)
 
 
 # --- Price discrepancy detection (cross-site) ---
@@ -341,6 +520,33 @@ def admin_discrepancies():
     return jsonify({"count": len(res), "results": res})
 
 
+@app.route("/admin/scan_sources", methods=["POST", "GET"])
+def admin_scan_sources():
+    # run scan in background thread to avoid blocking
+    t = threading.Thread(target=scan_aggregators_and_process, daemon=True)
+    t.start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/webhook/telegram", methods=["POST"])
+def webhook_telegram():
+    # Accept POST from Telethon listener (or other) with JSON {"text": "...", "channel": "..."}
+    data = request.get_json() or {}
+    text = data.get("text") or ""
+    channel = data.get("channel")
+    urls = re.findall(r'https?://\S+', text)
+    offers = []
+    # try to extract price in message text
+    price = parse_price_from_text(text)
+    title = text[:200]
+    for u in urls:
+        offers.append({"site": channel or "telegram", "url": u, "title": title, "price": price})
+    if offers:
+        notified = process_scraped_offers(offers)
+        return jsonify({"notified": len(notified)})
+    return jsonify({"processed_urls": len(urls)})
+
+
 @app.route("/", methods=["GET"])
 def index():
     db = get_db()
@@ -361,7 +567,6 @@ def add():
     if not url:
         return redirect(url_for("index"))
     site = detect_site(url)
-    # insert
     db = get_db()
     c = db.cursor()
     c.execute("INSERT INTO products (url, site, desired_price) VALUES (?, ?, ?)", (url, site, desired_price))
