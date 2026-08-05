@@ -362,6 +362,92 @@ def get_cimri_deals(listing_url="https://www.cimri.com/indirimler/"):
     return dedup
 
 
+# --- New robust akakce parser for fark-atan-fiyatlar ---
+_product_href_keywords = ["/urun", "/product", "-p-", "/fiyat", "/kampanya", "/kategori"]
+
+
+def _looks_like_product_href(href):
+    if not href:
+        return False
+    lower = href.lower()
+    for k in _product_href_keywords:
+        if k in lower:
+            return True
+    # if it's an absolute akakce link or relative link, accept as possible product
+    if "akakce.com" in lower or href.startswith("/"):
+        return True
+    return False
+
+
+def _extract_price_from_text(text):
+    if not text:
+        return None
+    m = re.search(r"([0-9\.,]+)\s*(?:₺|TL|tl)", text)
+    if not m:
+        m = re.search(r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)", text)
+    if not m:
+        return None
+    s = m.group(1).replace('.', '').replace(',', '.')
+    try:
+        return float(s)
+    except:
+        return None
+
+
+def get_akakce_deals_farkatan(listing_url="https://www.akakce.com/fark-atan-fiyatlar/"):
+    html = get_page(listing_url)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    offers = []
+    seen = set()
+
+    # find price-like text nodes
+    price_nodes = soup.find_all(text=re.compile(r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)"))
+    for txt_node in price_nodes:
+        text = txt_node.strip()
+        price = _extract_price_from_text(text)
+        if price is None:
+            continue
+        parent = txt_node.parent
+        # prefer anchors in parent subtree
+        a = None
+        if parent.name == "a" and parent.get("href"):
+            a = parent
+        else:
+            cur = parent
+            for _ in range(6):
+                if cur is None:
+                    break
+                a = cur.select_one("a[href]")
+                if a:
+                    break
+                cur = cur.parent
+        if not a:
+            for sib in parent.find_next_siblings(limit=4):
+                a = sib.select_one("a[href]")
+                if a:
+                    break
+        if not a:
+            continue
+        href = a.get("href")
+        if not href:
+            continue
+        if href.startswith("/"):
+            parsed = urlparse(listing_url)
+            href = f"{parsed.scheme}://{parsed.netloc}{href}"
+        if not _looks_like_product_href(href):
+            txt_anchor = a.get_text(" ", strip=True)
+            if len(txt_anchor) < 4 or not re.search(r"[A-Za-z0-9İĞÜŞÖÇığüşöç]", txt_anchor):
+                continue
+        title = a.get_text(" ", strip=True) or parent.get_text(" ", strip=True)
+        if href in seen:
+            continue
+        seen.add(href)
+        offers.append({"site": "akakce", "url": href, "title": title[:240], "price": price})
+    return offers
+
+
 # --- Process scraped offers: store and notify if new/cheap ---
 
 def store_or_update_offer(o):
